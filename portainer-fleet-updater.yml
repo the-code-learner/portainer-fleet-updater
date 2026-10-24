@@ -1,0 +1,249 @@
+services:
+  portainer-fleet-updater:
+    image: python:3.12-slim-bookworm
+    container_name: portainer-fleet-updater
+    restart: unless-stopped
+    working_dir: /opt/portainer-fleet-updater
+
+    ports:
+      - "127.0.0.1:9080:8080"
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    volumes:
+      - pfu_code:/opt/portainer-fleet-updater
+      - pfu_venv:/opt/venv
+      - pfu_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+    environment:
+      TZ: Europe/Rome
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+
+      PFU_REPO: the-code-learner/portainer-fleet-updater
+      PFU_VERSION: latest
+      PFU_CHECK_UPDATES_ON_START: "true"
+      PFU_FORCE_REFRESH: "false"
+
+      # SECRET: keep this value only in your private Portainer stack.
+      PORTAINER_API_TOKEN: ""
+
+      PORTAINER_URL: ""
+      PORTAINER_VERIFY_TLS: "false"
+
+      PFU_HOST: 0.0.0.0
+      PFU_PORT: "8080"
+      PFU_DATA_DIR: /data
+
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        set -eu
+        APP_ROOT=/opt/portainer-fleet-updater
+        REPO="$${PFU_REPO:-the-code-learner/portainer-fleet-updater}"
+        REQUESTED="$${PFU_VERSION:-latest}"
+        CHECK_UPDATES="$${PFU_CHECK_UPDATES_ON_START:-true}"
+        FORCE_REFRESH="$${PFU_FORCE_REFRESH:-false}"
+        CONTROL_FILE="$${PFU_RUNTIME_CONTROL_PATH:-$$APP_ROOT/.pfu-runtime-control.json}"
+        CONTROL_RESTART_REF=""
+        CONTROL_CHECK_ONCE="false"
+        CURRENT="$$APP_ROOT/current"
+        mkdir -p "$$APP_ROOT/releases"
+
+        if [ -s "$$CONTROL_FILE" ]; then
+          export CONTROL_FILE
+          if CONTROL_VALUES="$$(python - <<'PY'
+        import json, os, re
+        path = os.environ["CONTROL_FILE"]
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict):
+            raise RuntimeError("runtime control must be an object")
+        stable = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+")
+        selector = str(payload.get("selector") or "").strip()
+        restart_ref = str(payload.get("restart_ref_once") or "").strip()
+        if selector and selector != "latest" and not stable.fullmatch(selector):
+            raise RuntimeError("invalid runtime control selector")
+        if restart_ref and not stable.fullmatch(restart_ref):
+            raise RuntimeError("invalid one-shot restart ref")
+        print(selector)
+        print(restart_ref)
+        print("true" if payload.get("check_updates_once") is True else "false")
+        PY
+          )"; then
+            CONTROL_REQUESTED="$$(printf '%s\n' "$$CONTROL_VALUES" | sed -n '1p')"
+            CONTROL_RESTART_REF="$$(printf '%s\n' "$$CONTROL_VALUES" | sed -n '2p')"
+            CONTROL_CHECK_ONCE="$$(printf '%s\n' "$$CONTROL_VALUES" | sed -n '3p')"
+            [ -n "$$CONTROL_REQUESTED" ] && REQUESTED="$$CONTROL_REQUESTED"
+            [ "$$CONTROL_CHECK_ONCE" = "true" ] && CHECK_UPDATES="true"
+          else
+            echo "WARNING: ignoring invalid Fleet Updater runtime control state." >&2
+          fi
+        fi
+
+        case "$$CHECK_UPDATES" in
+          true|false) ;;
+          *) echo "ERROR: PFU_CHECK_UPDATES_ON_START must be true or false." >&2; exit 2 ;;
+        esac
+
+        case "$$REQUESTED" in
+          [0-9]*.[0-9]*.[0-9]*) REQUESTED="v$$REQUESTED" ;;
+        esac
+
+        REF="$$CONTROL_RESTART_REF"
+        if [ -z "$$REF" ] && [ "$$REQUESTED" = "latest" ]; then
+          if [ "$$CHECK_UPDATES" = "false" ] && [ -x "$$CURRENT/scripts/start.sh" ] && [ -s "$$CURRENT/.pfu-source-ready" ]; then
+            REF="$$(sed -n '1p' "$$CURRENT/.pfu-source-ready" | tr -d '\r\n')"
+            [ -n "$$REF" ] && echo "Update check disabled; using cached current source: $$REF"
+          fi
+
+          if [ -z "$$REF" ]; then
+            export REPO
+            if REF="$$(python - <<'PY'
+        import json, os, re, urllib.request
+        repo = os.environ["REPO"]
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+            raise RuntimeError("Invalid PFU_REPO")
+        request = urllib.request.Request(
+            f"https://api.github.com/repos/{repo}/releases?per_page=100",
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "Portainer-Fleet-Updater-bootstrap"},
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.load(response)
+        candidates = []
+        for release in payload if isinstance(payload, list) else []:
+            if release.get("draft") or release.get("prerelease"):
+                continue
+            tag = str(release.get("tag_name") or "").strip()
+            match = re.fullmatch(r"v([0-9]+)\.([0-9]+)\.([0-9]+)", tag)
+            if match:
+                candidates.append((tuple(int(x) for x in match.groups()), tag))
+        if not candidates:
+            raise RuntimeError("No stable Portainer Fleet Updater vX.Y.Z release found")
+        print(max(candidates, key=lambda item: item[0])[1])
+        PY
+            )"; then
+              :
+            elif [ -x "$$CURRENT/scripts/start.sh" ]; then
+              echo "WARNING: could not resolve latest release; using cached current release." >&2
+              exec "$$CURRENT/scripts/start.sh"
+            else
+              echo "ERROR: could not resolve latest release and no cached release exists." >&2
+              exit 1
+            fi
+          fi
+        elif [ -z "$$REF" ]; then
+          REF="$$REQUESTED"
+        fi
+
+        export PFU_REQUESTED_VERSION="$$REQUESTED"
+        export PFU_REF="$$REF"
+        REF_KEY="$$(printf '%s' "$$REF" | tr '/:@ ' '____')"
+        TARGET="$$APP_ROOT/releases/$$REF_KEY"
+
+        if [ "$$FORCE_REFRESH" = "true" ] || [ ! -f "$$TARGET/.pfu-source-ready" ]; then
+          STAGING="$$APP_ROOT/releases/.staging-$$REF_KEY-$$$$"
+          rm -rf "$$STAGING"
+          mkdir -p "$$STAGING"
+          export REPO REF STAGING
+          if python - <<'PY'
+        import io, os, pathlib, shutil, stat, tarfile, urllib.parse, urllib.request
+        repo = os.environ["REPO"]
+        ref = os.environ["REF"]
+        staging = pathlib.Path(os.environ["STAGING"])
+        url = f"https://codeload.github.com/{repo}/tar.gz/{urllib.parse.quote(ref, safe='')}"
+        print(f"Fetching Portainer Fleet Updater source: {repo}@{ref}")
+        with urllib.request.urlopen(url, timeout=60) as response:
+            payload = response.read()
+        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+            members = archive.getmembers()
+            roots = {m.name.split("/", 1)[0] for m in members if m.name}
+            if len(roots) != 1:
+                raise RuntimeError(f"Unexpected archive roots: {sorted(roots)}")
+            root = next(iter(roots))
+            for member in members:
+                if member.name == root:
+                    continue
+                rel = pathlib.PurePosixPath(member.name).relative_to(root)
+                if rel.is_absolute() or ".." in rel.parts:
+                    raise RuntimeError(f"Unsafe archive path: {member.name}")
+                if member.issym() or member.islnk():
+                    raise RuntimeError(f"Archive links are not allowed: {member.name}")
+                destination = staging.joinpath(*rel.parts)
+                if member.isdir():
+                    destination.mkdir(parents=True, exist_ok=True)
+                    continue
+                if not member.isfile():
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                source = archive.extractfile(member)
+                if source is None:
+                    raise RuntimeError(f"Could not read archive member: {member.name}")
+                with source, destination.open("wb") as output:
+                    shutil.copyfileobj(source, output)
+                if member.mode & stat.S_IXUSR:
+                    destination.chmod(destination.stat().st_mode | stat.S_IXUSR)
+        required = [
+            staging / "VERSION",
+            staging / "requirements.txt",
+            staging / "scripts" / "start.sh",
+            staging / "src" / "fleet_updater" / "runtime.py",
+        ]
+        missing = [str(p.relative_to(staging)) for p in required if not p.exists()]
+        if missing:
+            raise RuntimeError(f"Release is missing required files: {missing}")
+        (staging / ".pfu-source-ready").write_text(ref + "\n", encoding="utf-8")
+        PY
+          then
+            rm -rf "$$TARGET"
+            mv "$$STAGING" "$$TARGET"
+          else
+            rm -rf "$$STAGING"
+            if [ ! -f "$$TARGET/.pfu-source-ready" ]; then
+              if [ -x "$$CURRENT/scripts/start.sh" ]; then
+                echo "WARNING: requested release download failed; using cached current release." >&2
+                exec "$$CURRENT/scripts/start.sh"
+              fi
+              echo "ERROR: source download failed and no cached release exists." >&2
+              exit 1
+            fi
+            echo "WARNING: source refresh failed; using cached $$TARGET" >&2
+          fi
+        fi
+
+        rm -f "$$CURRENT"
+        ln -s "$$TARGET" "$$CURRENT"
+
+        if [ -s "$$CONTROL_FILE" ] && { [ -n "$$CONTROL_RESTART_REF" ] || [ "$$CONTROL_CHECK_ONCE" = "true" ]; }; then
+          export CONTROL_FILE
+          python - <<'PY' || echo "WARNING: could not clear one-shot runtime control state." >&2
+        import json, os, pathlib
+        path = pathlib.Path(os.environ["CONTROL_FILE"])
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            payload.pop("restart_ref_once", None)
+            payload.pop("check_updates_once", None)
+            temporary = path.with_name(path.name + ".tmp")
+            temporary.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+            temporary.replace(path)
+        PY
+        fi
+
+        exec "$$CURRENT/scripts/start.sh"
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/venv/bin/python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).read()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  pfu_code:
+  pfu_venv:
+  pfu_data:

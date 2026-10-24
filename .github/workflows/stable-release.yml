@@ -1,0 +1,93 @@
+name: stable application release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - VERSION
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: stable-application-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test release source
+        run: |
+          PYTHONPATH=src python -m compileall -q src tests
+          PYTHONPATH=src python -m unittest discover -s tests -v
+
+      - name: Prepare release metadata
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+          version = Path("VERSION").read_text(encoding="utf-8").strip()
+          if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+              raise SystemExit(f"Invalid VERSION: {version!r}")
+          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          match = re.search(
+              rf"^## {re.escape(version)} - .*?\n(?P<body>.*?)(?=^## |\Z)",
+              changelog,
+              flags=re.MULTILINE | re.DOTALL,
+          )
+          if not match:
+              raise SystemExit(f"CHANGELOG entry missing for {version}")
+          tag = f"v{version}"
+          Path("/tmp/release-notes.md").write_text(match.group(0).strip() + "\n", encoding="utf-8")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write(f"RELEASE_TAG={tag}\n")
+          print(f"Prepared {tag}")
+          PY
+
+      - name: Create immutable tag and stable GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          REMOTE_SHA="$(git ls-remote origin "refs/tags/$RELEASE_TAG" | awk '{print $1}')"
+          if [ -n "$REMOTE_SHA" ]; then
+            if [ "$REMOTE_SHA" != "$GITHUB_SHA" ]; then
+              echo "ERROR: immutable tag $RELEASE_TAG already points to $REMOTE_SHA, not $GITHUB_SHA" >&2
+              exit 1
+            fi
+          else
+            git tag "$RELEASE_TAG" "$GITHUB_SHA"
+            git push origin "$RELEASE_TAG"
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Stable release $RELEASE_TAG already exists."
+          else
+            gh release create "$RELEASE_TAG" \
+              --verify-tag \
+              --title "Portainer Fleet Updater $RELEASE_TAG" \
+              --notes-file /tmp/release-notes.md
+          fi
+
+          gh release view "$RELEASE_TAG" --json tagName,isDraft,isPrerelease > /tmp/release.json
+          python - <<'PY'
+          import json
+          import os
+          data = json.load(open("/tmp/release.json", encoding="utf-8"))
+          assert data["tagName"] == os.environ["RELEASE_TAG"]
+          assert data["isDraft"] is False
+          assert data["isPrerelease"] is False
+          print("Stable release verified:", data["tagName"])
+          PY
